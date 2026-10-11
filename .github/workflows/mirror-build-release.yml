@@ -1,0 +1,117 @@
+name: Build and Release from GitGud
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # 每小时一次（UTC）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      # 1. 拉取上游代码
+      - name: Clone upstream
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://gitgud.io/fuckworld/115.git upstream
+          $sha = git -C upstream rev-parse HEAD
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+        id: clone
+
+      # 2. 检查这个 commit 是否已经发过 Release
+      - name: Check if already released
+        id: check
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $sha = "${{ steps.clone.outputs.sha }}"
+          $short = $sha.Substring(0,7)
+          # 查现有 release 里有没有包含这个 sha 的 tag
+          $exists = gh release list --limit 100 --json tagName --jq '.[].tagName' |
+                    Select-String -Pattern $short -Quiet
+          if ($exists) {
+            "skip=true" >> $env:GITHUB_OUTPUT
+            Write-Host "Commit $short already released, skipping build."
+          } else {
+            "skip=false" >> $env:GITHUB_OUTPUT
+            Write-Host "New commit $short, will build."
+          }
+
+      # 3. 准备 Go（仅在需要构建时）
+      - name: Setup Go
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      # 4. 构建
+      - name: Build server
+        if: steps.check.outputs.skip == 'false'
+        shell: pwsh
+        working-directory: upstream
+        run: |
+          ./server/Build-Server.ps1 -Go "go"
+
+      # 5. 收集产物
+      - name: Collect artifacts
+        if: steps.check.outputs.skip == 'false'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item upstream/server/work/dfo-lan/bin/wireprobe-handoff-source.exe dist/ -ErrorAction SilentlyContinue
+          Copy-Item upstream/server/work/dfo-lan/bin/wireprobe-pvf.exe dist/ -ErrorAction SilentlyContinue
+          Get-ChildItem dist
+
+      # 6. 生成 Release 命名信息
+      - name: Prepare release metadata
+        if: steps.check.outputs.skip == 'false'
+        id: meta
+        shell: pwsh
+        run: |
+          $sha = "${{ steps.clone.outputs.sha }}".Substring(0,7)
+          $ts = (Get-Date -AsUTC -Format "yyyyMMdd-HHmm")
+          "ts=$ts" >> $env:GITHUB_OUTPUT
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "tag=build-$ts-$sha" >> $env:GITHUB_OUTPUT
+
+      # 7. 打包
+      - name: Package
+        if: steps.check.outputs.skip == 'false'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/*.exe -DestinationPath "wireprobe-${{ steps.meta.outputs.ts }}.zip" -Force
+
+      # 8. 发布 Release
+      - name: Create Release
+        if: steps.check.outputs.skip == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: "Build ${{ steps.meta.outputs.ts }} (upstream ${{ steps.meta.outputs.sha }})"
+          files: |
+            dist/*.exe
+            wireprobe-*.zip
+
+      # 9. 清理超过 3 天的 Release（无论本次是否构建都执行）
+      - name: Cleanup old releases
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $cutoff = (Get-Date).ToUniversalTime().AddDays(-3)
+          Write-Host "Removing releases older than $cutoff"
+          $tags = gh release list --limit 200 --json tagName,createdAt --jq '.[] | "\(.tagName) \(.createdAt)"'
+          foreach ($line in $tags) {
+            $parts = $line -split ' '
+            $tag = $parts[0]
+            $created = [datetime]::Parse($parts[1]).ToUniversalTime()
+            if ($created -lt $cutoff) {
+              Write-Host "Deleting release $tag (created $created)"
+              gh release delete $tag --yes --cleanup-tag
+            }
+          }
