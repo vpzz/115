@@ -2,7 +2,7 @@ name: Build and Release from GitGud
 
 on:
   schedule:
-    - cron: '0 * * * *'   # 每小时一次（UTC）
+    - cron: '0 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -12,16 +12,21 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      # 1. 拉取上游代码
+      # 0. 一开始就 checkout 自己的仓库，让当前目录是 git 仓库
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Clone upstream
+        id: clone
         shell: pwsh
         run: |
           git clone --depth 1 https://gitgud.io/fuckworld/115.git upstream
           $sha = git -C upstream rev-parse HEAD
           "sha=$sha" >> $env:GITHUB_OUTPUT
-        id: clone
+          Write-Host "Cloned upstream at $sha"
 
-      # 2. 检查这个 commit 是否已经发过 Release
       - name: Check if already released
         id: check
         shell: pwsh
@@ -29,26 +34,39 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $sha = "${{ steps.clone.outputs.sha }}"
+          if (-not $sha) {
+            Write-Host "No sha found, will build."
+            "skip=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
           $short = $sha.Substring(0,7)
-          # 查现有 release 里有没有包含这个 sha 的 tag
-          $exists = gh release list --limit 100 --json tagName --jq '.[].tagName' |
-                    Select-String -Pattern $short -Quiet
-          if ($exists) {
+          Write-Host "Upstream short sha: $short"
+
+          $tags = gh release list --limit 100 --json tagName --jq '.[].tagName'
+          Write-Host "Existing release tags:"
+          $tags | ForEach-Object { Write-Host "  $_" }
+
+          $hit = $false
+          if ($tags) {
+            foreach ($t in $tags) {
+              if ($t -like "*$short*") { $hit = $true; break }
+            }
+          }
+
+          if ($hit) {
             "skip=true" >> $env:GITHUB_OUTPUT
-            Write-Host "Commit $short already released, skipping build."
+            Write-Host "Already released $short, skipping."
           } else {
             "skip=false" >> $env:GITHUB_OUTPUT
             Write-Host "New commit $short, will build."
           }
 
-      # 3. 准备 Go（仅在需要构建时）
       - name: Setup Go
         if: steps.check.outputs.skip == 'false'
         uses: actions/setup-go@v5
         with:
           go-version: 'stable'
 
-      # 4. 构建
       - name: Build server
         if: steps.check.outputs.skip == 'false'
         shell: pwsh
@@ -56,7 +74,6 @@ jobs:
         run: |
           ./server/Build-Server.ps1 -Go "go"
 
-      # 5. 收集产物
       - name: Collect artifacts
         if: steps.check.outputs.skip == 'false'
         shell: pwsh
@@ -66,7 +83,6 @@ jobs:
           Copy-Item upstream/server/work/dfo-lan/bin/wireprobe-pvf.exe dist/ -ErrorAction SilentlyContinue
           Get-ChildItem dist
 
-      # 6. 生成 Release 命名信息
       - name: Prepare release metadata
         if: steps.check.outputs.skip == 'false'
         id: meta
@@ -78,14 +94,12 @@ jobs:
           "sha=$sha" >> $env:GITHUB_OUTPUT
           "tag=build-$ts-$sha" >> $env:GITHUB_OUTPUT
 
-      # 7. 打包
       - name: Package
         if: steps.check.outputs.skip == 'false'
         shell: pwsh
         run: |
           Compress-Archive -Path dist/*.exe -DestinationPath "wireprobe-${{ steps.meta.outputs.ts }}.zip" -Force
 
-      # 8. 发布 Release
       - name: Create Release
         if: steps.check.outputs.skip == 'false'
         uses: softprops/action-gh-release@v2
@@ -96,7 +110,6 @@ jobs:
             dist/*.exe
             wireprobe-*.zip
 
-      # 9. 清理超过 3 天的 Release（无论本次是否构建都执行）
       - name: Cleanup old releases
         if: always()
         shell: pwsh
@@ -105,8 +118,8 @@ jobs:
         run: |
           $cutoff = (Get-Date).ToUniversalTime().AddDays(-3)
           Write-Host "Removing releases older than $cutoff"
-          $tags = gh release list --limit 200 --json tagName,createdAt --jq '.[] | "\(.tagName) \(.createdAt)"'
-          foreach ($line in $tags) {
+          $list = gh release list --limit 200 --json tagName,createdAt --jq '.[] | "\(.tagName) \(.createdAt)"'
+          foreach ($line in $list) {
             $parts = $line -split ' '
             $tag = $parts[0]
             $created = [datetime]::Parse($parts[1]).ToUniversalTime()
