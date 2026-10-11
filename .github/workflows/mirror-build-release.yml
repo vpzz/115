@@ -12,7 +12,6 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      # 0. 一开始就 checkout 自己的仓库，让当前目录是 git 仓库
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
@@ -22,9 +21,12 @@ jobs:
         id: clone
         shell: pwsh
         run: |
-          git clone --depth 1 https://gitgud.io/fuckworld/115.git upstream
-          $sha = git -C upstream rev-parse HEAD
+          git clone https://gitgud.io/fuckworld/115.git upstream
+          cd upstream
+          $sha = git rev-parse HEAD
+          $short = $sha.Substring(0,7)
           "sha=$sha" >> $env:GITHUB_OUTPUT
+          "short=$short" >> $env:GITHUB_OUTPUT
           Write-Host "Cloned upstream at $sha"
 
       - name: Check if already released
@@ -33,26 +35,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $sha = "${{ steps.clone.outputs.sha }}"
-          if (-not $sha) {
-            Write-Host "No sha found, will build."
-            "skip=false" >> $env:GITHUB_OUTPUT
-            exit 0
-          }
-          $short = $sha.Substring(0,7)
-          Write-Host "Upstream short sha: $short"
-
+          $short = "${{ steps.clone.outputs.short }}"
           $tags = gh release list --limit 100 --json tagName --jq '.[].tagName'
-          Write-Host "Existing release tags:"
-          $tags | ForEach-Object { Write-Host "  $_" }
-
           $hit = $false
           if ($tags) {
             foreach ($t in $tags) {
               if ($t -like "*$short*") { $hit = $true; break }
             }
           }
-
           if ($hit) {
             "skip=true" >> $env:GITHUB_OUTPUT
             Write-Host "Already released $short, skipping."
@@ -66,49 +56,133 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: 'stable'
+          cache: true
+          cache-dependency-path: upstream/server/work/dfo-lan/go.sum
 
-      - name: Build server
+      - name: Build server (wireprobe)
         if: steps.check.outputs.skip == 'false'
         shell: pwsh
         working-directory: upstream
         run: |
-          ./server/Build-Server.ps1 -Go "go"
+          ./server/Build-Server.ps1 -Go "go" -SkipModGenGate
 
-      - name: Collect artifacts
+      - name: Build dfolauncher
         if: steps.check.outputs.skip == 'false'
         shell: pwsh
+        working-directory: upstream/server/work/dfo-lan
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item upstream/server/work/dfo-lan/bin/wireprobe-handoff-source.exe dist/ -ErrorAction SilentlyContinue
-          Copy-Item upstream/server/work/dfo-lan/bin/wireprobe-pvf.exe dist/ -ErrorAction SilentlyContinue
-          Get-ChildItem dist
+          go build -trimpath -o bin/dfolauncher.exe ./cmd/dfolauncher
+          if ($LASTEXITCODE -ne 0) { throw "dfolauncher build failed" }
+          Get-ChildItem bin
 
       - name: Prepare release metadata
         if: steps.check.outputs.skip == 'false'
         id: meta
         shell: pwsh
         run: |
-          $sha = "${{ steps.clone.outputs.sha }}".Substring(0,7)
-          $ts = (Get-Date -AsUTC -Format "yyyyMMdd-HHmm")
+          $now = (Get-Date).ToUniversalTime().AddHours(8)  # 北京时间
+          $ts = $now.ToString("yyyy-MM-dd-HH-mm")
+          $short = "${{ steps.clone.outputs.short }}"
           "ts=$ts" >> $env:GITHUB_OUTPUT
-          "sha=$sha" >> $env:GITHUB_OUTPUT
-          "tag=build-$ts-$sha" >> $env:GITHUB_OUTPUT
+          "short=$short" >> $env:GITHUB_OUTPUT
+          "tag=v$ts-$short" >> $env:GITHUB_OUTPUT
+          Write-Host "Release tag: v$ts-$short"
 
-      - name: Package
+      - name: Assemble package
         if: steps.check.outputs.skip == 'false'
         shell: pwsh
         run: |
-          Compress-Archive -Path dist/*.exe -DestinationPath "wireprobe-${{ steps.meta.outputs.ts }}.zip" -Force
+          $src = "upstream"
+          $pkg = "package/server"
+          New-Item -ItemType Directory -Force -Path "$pkg/work/dfo-lan/bin" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$pkg/work/dfo_probe_tools" | Out-Null
+
+          # bin 产物
+          Copy-Item "$src/server/work/dfo-lan/bin/wireprobe-pvf.exe" "$pkg/work/dfo-lan/bin/" -Force
+          Copy-Item "$src/server/work/dfo-lan/bin/dfolauncher.exe" "$pkg/work/dfo-lan/bin/" -Force
+
+          # configs（排除 *.local.json）
+          $cfgSrc = "$src/server/work/dfo-lan/configs"
+          $cfgDst = "$pkg/work/dfo-lan/configs"
+          New-Item -ItemType Directory -Force -Path $cfgDst | Out-Null
+          Get-ChildItem $cfgSrc -Recurse -File | Where-Object { $_.Name -notlike '*.local.json' } | ForEach-Object {
+            $rel = $_.FullName.Substring((Resolve-Path $cfgSrc).Path.Length).TrimStart('\')
+            $dst = Join-Path $cfgDst $rel
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dst) | Out-Null
+            Copy-Item $_.FullName $dst -Force
+          }
+
+          # runtime/*.bin
+          $rtSrc = "$src/server/work/dfo-lan/runtime"
+          if (Test-Path $rtSrc) {
+            New-Item -ItemType Directory -Force -Path "$pkg/work/dfo-lan/runtime" | Out-Null
+            Get-ChildItem "$rtSrc/*.bin" -File -ErrorAction SilentlyContinue | ForEach-Object {
+              Copy-Item $_.FullName "$pkg/work/dfo-lan/runtime/" -Force
+            }
+          }
+
+          # cmd/wireprobe/testdata
+          $tdSrc = "$src/server/work/dfo-lan/cmd/wireprobe/testdata"
+          if (Test-Path $tdSrc) {
+            $tdDst = "$pkg/work/dfo-lan/cmd/wireprobe/testdata"
+            New-Item -ItemType Directory -Force -Path $tdDst | Out-Null
+            Copy-Item "$tdSrc/*" $tdDst -Recurse -Force
+          }
+
+          # probe.exe
+          Copy-Item "$src/server/work/dfo_probe_tools/probe.exe" "$pkg/work/dfo_probe_tools/" -Force
+
+          # launcher.example.json
+          Copy-Item "$src/server/launcher.example.json" "$pkg/" -Force
+
+          Write-Host "包结构："
+          Get-ChildItem package -Recurse | ForEach-Object { Write-Host $_.FullName }
+
+      - name: Get recent commits
+        if: steps.check.outputs.skip == 'false'
+        id: commits
+        shell: pwsh
+        working-directory: upstream
+        run: |
+          $log = git log -3 --pretty=format:"- ``%h`` %s (%an, %ad)" --date=short
+          $log | Out-File -FilePath "$env:GITHUB_WORKSPACE\commits.txt" -Encoding utf8
+          Get-Content "$env:GITHUB_WORKSPACE\commits.txt"
+
+      - name: Package zip
+        if: steps.check.outputs.skip == 'false'
+        shell: pwsh
+        run: |
+          $zipName = "${{ steps.meta.outputs.ts }}-commit-${{ steps.meta.outputs.short }}.zip"
+          Compress-Archive -Path "package/*" -DestinationPath $zipName -Force
+          Get-ChildItem *.zip
 
       - name: Create Release
         if: steps.check.outputs.skip == 'false'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
-          name: "Build ${{ steps.meta.outputs.ts }} (upstream ${{ steps.meta.outputs.sha }})"
+          name: "${{ steps.meta.outputs.ts }} (upstream ${{ steps.meta.outputs.short }})"
+          body_path: commits.txt
           files: |
-            dist/*.exe
-            wireprobe-*.zip
+            *.zip
+          append_body: false
+
+      - name: Prepend release notes
+        if: steps.check.outputs.skip == 'false'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $header = @"
+          部署方法：在启动器同级别目录下新建一个 server 目录，把压缩包解压放进去，然后放入你的存档即可。
+
+          最近 3 次上游提交：
+          "@
+          $commits = Get-Content "$env:GITHUB_WORKSPACE\commits.txt" -Raw
+          $body = $header + "`n" + $commits
+          $body | Out-File -FilePath body.txt -Encoding utf8 -NoNewline
+          gh release edit $tag --notes-file body.txt
 
       - name: Cleanup old releases
         if: always()
