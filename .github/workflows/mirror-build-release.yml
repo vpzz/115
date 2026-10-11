@@ -2,7 +2,7 @@ name: Build and Release from GitGud
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '*/30 * * * *'   # 每 30 分钟一次（UTC）
   workflow_dispatch:
 
 permissions:
@@ -36,7 +36,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $short = "${{ steps.clone.outputs.short }}"
-          $tags = gh release list --limit 100 --json tagName --jq '.[].tagName'
+          $tags = gh release list --limit 200 --json tagName --jq '.[].tagName'
           $hit = $false
           if ($tags) {
             foreach ($t in $tags) {
@@ -175,7 +175,8 @@ jobs:
         run: |
           $tag = "${{ steps.meta.outputs.tag }}"
           $header = @"
-          部署方法：在启动器同级别目录下新建一个 server 目录，把压缩包解压放进去，然后放入你的存档即可。
+          部署方法：把压缩包直接解压到和启动器同级别的目录下，然后放入你的存档即可。
+          压缩包内已自带 server 目录，解压后会自动与启动器同级。
 
           最近 3 次上游提交：
           "@
@@ -190,7 +191,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $cutoff = (Get-Date).ToUniversalTime().AddDays(-3)
+          $cutoff = (Get-Date).ToUniversalTime().AddDays(-2)
           Write-Host "Removing releases older than $cutoff"
           $list = gh release list --limit 200 --json tagName,createdAt --jq '.[] | "\(.tagName) \(.createdAt)"'
           foreach ($line in $list) {
