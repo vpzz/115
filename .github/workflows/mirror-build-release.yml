@@ -1,8 +1,6 @@
 name: Build and Release from GitGud
 
 on:
-  schedule:
-    - cron: '*/30 * * * *'   # 每 30 分钟一次（UTC）
   workflow_dispatch:
 
 permissions:
