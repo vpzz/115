@@ -194,7 +194,7 @@ jobs:
 
           # 按创建时间倒序取出所有 release 的 tagName，跳过前 $keep 个
           $toDelete = gh release list --limit 200 --json tagName,createdAt `
-            --jq "sort_by(.createdAt) | reverse | .[$keep:] | .[].tagName"
+            --jq "sort_by(.createdAt) | reverse | .[${keep}:] | .[].tagName"
 
           if (-not $toDelete) {
             Write-Host "No releases to delete."
